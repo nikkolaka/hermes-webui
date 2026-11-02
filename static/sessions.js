@@ -5212,7 +5212,7 @@ let _allProjects = [];  // cached project list
 const NO_PROJECT_FILTER = '__none__';
 let _activeProject = null;  // project_id filter (null = show all, NO_PROJECT_FILTER = unassigned only)
 const SHOW_ALL_PROFILES_STORAGE_KEY = 'hermes-show-all-profiles';
-let _showAllProfiles = false;  // false = filter to active profile only
+let _showAllProfiles = true;  // always aggregate every profile's chats
 let _profileSwitchOpeningExistingSession = false;  // true while cross-profile sidebar click switches profile before loadSession()
 let _otherProfileCount = 0;       // count of sessions from other profiles (server-reported)
 let _archivedWebuiCount = 0;      // archived WebUI sessions not fetched until requested
@@ -5223,15 +5223,13 @@ let _serverCliSessionCount = null;    // explicit server count for CLI sessions
 let _sessionSourceFilter = 'webui';  // 'webui' keeps WebUI chats separate from read-only CLI sessions
 
 function _restoreShowAllProfiles(){
-  try{
-    const raw=localStorage.getItem(SHOW_ALL_PROFILES_STORAGE_KEY);
-    _showAllProfiles = raw === '1' || raw === 'true';
-  }catch(_e){ _showAllProfiles = false; }
+  _showAllProfiles = true;
+  try{ localStorage.setItem(SHOW_ALL_PROFILES_STORAGE_KEY,'1'); }catch(_e){}
 }
 
 function _setShowAllProfiles(enabled){
-  _showAllProfiles=!!enabled;
-  try{ localStorage.setItem(SHOW_ALL_PROFILES_STORAGE_KEY,_showAllProfiles?'1':'0'); }catch(_e){}
+  _showAllProfiles=true;
+  try{ localStorage.setItem(SHOW_ALL_PROFILES_STORAGE_KEY,'1'); }catch(_e){}
 }
 
 _restoreShowAllProfiles();
@@ -10104,25 +10102,9 @@ function renderSessionListFromCache(){
     bar.appendChild(addBtn);
     list.appendChild(bar);
   }
-  // Profile filter toggle (show sessions from other profiles).
-  // Cross-profile rows live SERVER-SIDE behind ?all_profiles=1, so the toggle
-  // must trigger a refetch — there's no client-cached aggregate to slice through.
-  // The server is authoritative for the count (renamed-root cross-alias is
-  // server-side). A naive strict-equality client fallback would mis-count.
-  const otherProfileCount = _otherProfileCount;
-  if(otherProfileCount>0&&!_showAllProfiles){
-    const pfToggle=document.createElement('div');
-    pfToggle.style.cssText='font-size:10px;padding:4px 10px;color:var(--muted);cursor:pointer;text-align:center;opacity:.7;';
-    pfToggle.textContent='Show '+otherProfileCount+' from other profiles';
-    pfToggle.onclick=()=>{_setShowAllProfiles(true);renderSessionList({deferWhileInteracting:false});};
-    list.appendChild(pfToggle);
-  } else if(_showAllProfiles){
-    const pfToggle=document.createElement('div');
-    pfToggle.style.cssText='font-size:10px;padding:4px 10px;color:var(--muted);cursor:pointer;text-align:center;opacity:.7;';
-    pfToggle.textContent='Show active profile only';
-    pfToggle.onclick=()=>{_setShowAllProfiles(false);renderSessionList({deferWhileInteracting:false});};
-    list.appendChild(pfToggle);
-  }
+  // Profile filtering is intentionally disabled: this sidebar always lists
+  // every profile's chats. The profile switcher still chooses the profile for
+  // new conversations, but it no longer hides existing sessions.
   // Show/hide archived toggle if there are archived sessions. Archived rows
   // are fetched on demand so large histories do not bloat every sidebar poll.
   if(archivedCount>0||_showArchived){

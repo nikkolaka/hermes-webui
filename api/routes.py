@@ -15496,6 +15496,115 @@ def _render_index_shell_base() -> str:
     return base
 
 
+# perf(webui/session-load-latency): the live run snapshot is rebuilt from the
+# run journal on EVERY metadata-only load of a session whose turn is still in
+# flight — two full parses of the .jsonl (find_run_summary + read_run_events)
+# plus redaction of the assembled reasoning text. On a 1.4 MB / 3.5k-event
+# journal that is ~500 ms per load, and the WebUI re-fetches the open
+# conversation on a timer, so the same bytes are re-parsed dozens of times a
+# minute while a turn runs (measured: 212 loads/hour on one conversation,
+# 872 ms average).
+#
+# Serve the ALREADY-REDACTED payload from a short TTL cache instead. Real-time
+# tokens still arrive over the SSE stream, so the only cost of a hit is a few
+# seconds of staleness in the cold-load progress snapshot — and a stale
+# snapshot during a live turn is strictly better than a 30 s stall.
+#
+# Keyed by (session profile, stream id): the cached payload was built for a
+# session already proven visible to the requesting profile, and the key keeps
+# that scoping explicit. The TTL intentionally ignores journal stat changes —
+# a live journal is appended on every event, so a signature-keyed cache would
+# never hit, which is exactly the case this exists for.
+_LIVE_SNAPSHOT_CACHE_MAX = 16
+_LIVE_SNAPSHOT_CACHE_TTL_SECONDS = 10.0
+_live_snapshot_cache: "OrderedDict[tuple, tuple[float, dict]]" = OrderedDict()
+# The run SUMMARY is the other full parse on this path (find_run_summary over
+# the same journal). Its own upstream cache is signature-keyed, so a journal
+# that is appended on every event NEVER hits; under CPU contention that single
+# parse is worth seconds. Same TTL, same keying.
+_live_journal_cache: "OrderedDict[tuple, tuple[float, dict]]" = OrderedDict()
+_live_snapshot_cache_lock = threading.Lock()
+
+
+def _live_snapshot_cache_ttl_seconds() -> float:
+    raw = os.environ.get("HERMES_WEBUI_LIVE_SNAPSHOT_TTL_S")
+    if raw is None or str(raw).strip() == "":
+        return _LIVE_SNAPSHOT_CACHE_TTL_SECONDS
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return _LIVE_SNAPSHOT_CACHE_TTL_SECONDS
+
+
+def _live_snapshot_cache_key(profile, stream_id) -> tuple:
+    return (str(profile or ""), str(stream_id or ""))
+
+
+def _ttl_cache_get(cache, profile, stream_id) -> dict | None:
+    key = _live_snapshot_cache_key(profile, stream_id)
+    if not key[1]:
+        return None
+    ttl = _live_snapshot_cache_ttl_seconds()
+    if ttl <= 0:
+        return None
+    now = time.monotonic()
+    with _live_snapshot_cache_lock:
+        entry = cache.get(key)
+        if entry is None:
+            return None
+        expires_at, payload = entry
+        if expires_at <= now:
+            cache.pop(key, None)
+            return None
+        cache.move_to_end(key)
+    # Shallow copy: callers attach this straight into the response body (no
+    # mutation), but a fresh top-level dict keeps a stray key write from
+    # poisoning every later hit.
+    return dict(payload) if isinstance(payload, dict) else None
+
+
+def _ttl_cache_put(cache, profile, stream_id, payload) -> None:
+    if not isinstance(payload, dict):
+        return
+    key = _live_snapshot_cache_key(profile, stream_id)
+    if not key[1]:
+        return
+    ttl = _live_snapshot_cache_ttl_seconds()
+    if ttl <= 0:
+        return
+    with _live_snapshot_cache_lock:
+        cache[key] = (time.monotonic() + ttl, payload)
+        cache.move_to_end(key)
+        while len(cache) > _LIVE_SNAPSHOT_CACHE_MAX:
+            cache.popitem(last=False)
+
+
+def _live_snapshot_cache_get(profile, stream_id) -> dict | None:
+    """Return the cached redacted snapshot payload for this stream, or None."""
+    return _ttl_cache_get(_live_snapshot_cache, profile, stream_id)
+
+
+def _live_snapshot_cache_put(profile, stream_id, payload) -> None:
+    """Cache an already-redacted snapshot payload for the configured TTL."""
+    _ttl_cache_put(_live_snapshot_cache, profile, stream_id, payload)
+
+
+def _live_journal_cache_get(profile, stream_id) -> dict | None:
+    """Return the cached run-journal summary for this stream, or None."""
+    return _ttl_cache_get(_live_journal_cache, profile, stream_id)
+
+
+def _live_journal_cache_put(profile, stream_id, summary) -> None:
+    _ttl_cache_put(_live_journal_cache, profile, stream_id, summary)
+
+
+def _live_snapshot_cache_drop(profile, stream_id) -> None:
+    key = _live_snapshot_cache_key(profile, stream_id)
+    with _live_snapshot_cache_lock:
+        _live_snapshot_cache.pop(key, None)
+        _live_journal_cache.pop(key, None)
+
+
 def _handle_session_get(handler, parsed) -> bool:
     """GET /api/session — full session payload (messages, tool calls, lineage...). Extracted verbatim from handle_get; every early-return path calls _diag.finish() (see the tier2c note inside)."""
     import time as _time
@@ -15578,6 +15687,11 @@ def _handle_session_get(handler, parsed) -> bool:
             if _diag: _diag.finish()
             return bad(handler, "Session not found", 404)
         original_stream_id = getattr(s, "active_stream_id", None)
+        # Live-snapshot memo (see _live_snapshot_cache_*): a hit attaches after
+        # the redaction pass, a miss records the redacted payload for the next
+        # poll of the same in-flight turn.
+        _cached_live_snapshot = None
+        _fresh_snapshot_for_cache = False
         _clear_stale_stream_state(s)
         cli_meta = _lookup_cli_session_metadata(sid) if _session_requires_cli_metadata_lookup(s) else {}
         is_messaging_session = _is_messaging_session_record(s) or _is_messaging_session_record(cli_meta)
@@ -15921,10 +16035,18 @@ def _handle_session_get(handler, parsed) -> bool:
             "last_prompt_tokens": getattr(s, "last_prompt_tokens", 0) or 0,
         }
         if original_stream_id:
-            try:
-                journal = find_run_summary(original_stream_id)
-            except Exception:
-                journal = None
+            # Memoized: a live journal is appended on every event, so upstream's
+            # signature-keyed summary cache never hits and this full parse runs
+            # again on every poll of an in-flight turn (148 ms at 1.4 MB idle,
+            # seconds under contention).
+            journal = _live_journal_cache_get(_session_profile, original_stream_id)
+            if journal is None:
+                try:
+                    journal = find_run_summary(original_stream_id)
+                except Exception:
+                    journal = None
+                if journal:
+                    _live_journal_cache_put(_session_profile, original_stream_id, journal)
             if journal:
                 journal_active = bool(original_stream_id in active_stream_ids)
                 raw["runtime_journal"] = _run_journal_status_payload(
@@ -15932,18 +16054,26 @@ def _handle_session_get(handler, parsed) -> bool:
                     active=journal_active,
                 )
                 if journal_active and (not load_messages or msg_limit is None):
-                    try:
-                        snapshot = _run_journal_live_snapshot(original_stream_id, handler=handler)
-                    except Exception:
-                        logger.debug(
-                            "Failed to build runtime journal snapshot for %s",
-                            original_stream_id,
-                            exc_info=True,
-                        )
-                        snapshot = None
-                    if snapshot:
-                        raw["runtime_journal_snapshot"] = _runtime_journal_snapshot_for_session_payload(snapshot)
+                    _cached_live_snapshot = _live_snapshot_cache_get(_session_profile, original_stream_id)
+                    if _cached_live_snapshot is not None:
+                        # Already redacted when it was built; attached after the
+                        # global redaction pass below so the same ~1 MB of
+                        # transcript is not walked again on every poll.
                         raw["pending_attachments"] = getattr(s, "pending_attachments", []) or []
+                    else:
+                        try:
+                            snapshot = _run_journal_live_snapshot(original_stream_id, handler=handler)
+                        except Exception:
+                            logger.debug(
+                                "Failed to build runtime journal snapshot for %s",
+                                original_stream_id,
+                                exc_info=True,
+                            )
+                            snapshot = None
+                        if snapshot:
+                            raw["runtime_journal_snapshot"] = _runtime_journal_snapshot_for_session_payload(snapshot)
+                            raw["pending_attachments"] = getattr(s, "pending_attachments", []) or []
+                            _fresh_snapshot_for_cache = True
         # Cold-load: derive the latest settled todo snapshot from the full
         # merged transcript, not the truncated display window. This keeps
         # the Todos panel correct after refresh even when the latest todo
@@ -16031,6 +16161,13 @@ def _handle_session_get(handler, parsed) -> bool:
             if revision:
                 raw["regeneration_revision"] = revision
         redact = redact_session_data(raw)
+        if _cached_live_snapshot is not None:
+            # Cache hit: this payload was produced by this same redaction pass
+            # when it was built, so re-attaching it after the pass is equivalent
+            # to redacting it again — just without walking the transcript twice.
+            redact["runtime_journal_snapshot"] = _cached_live_snapshot
+        elif _fresh_snapshot_for_cache and isinstance(redact.get("runtime_journal_snapshot"), dict):
+            _live_snapshot_cache_put(_session_profile, original_stream_id, redact["runtime_journal_snapshot"])
         _t5 = _time.monotonic()
         if _diag: _diag.stage("t5_after_redact")
         resp = j(handler, {"session": redact})
@@ -16285,9 +16422,16 @@ def handle_get(handler, parsed) -> bool:
             'style="display:none">Sign in with passkey</button>'
         )
         if is_password_auth_enabled():
+            _expected_username = os.getenv("HERMES_WEBUI_USERNAME", "").strip()
+            _username_input_html = (
+                '<input type="text" id="user" placeholder="Username" '
+                'autocomplete="username" autocapitalize="none" spellcheck="false" autofocus>'
+                if _expected_username else ""
+            )
+            _password_autofocus = "" if _username_input_html else " autofocus"
             _password_form_html = (
-                f'<input type="password" id="pw" '
-                f'placeholder="{_html.escape(_login_strings["placeholder"])}" autofocus>'
+                f'{_username_input_html}<input type="password" id="pw" '
+                f'placeholder="{_html.escape(_login_strings["placeholder"])}"{_password_autofocus}>'
                 f'<button type="submit">{_html.escape(_login_strings["btn"])}</button>'
                 f'{_passkey_button_html}'
             )
@@ -16295,6 +16439,16 @@ def handle_get(handler, parsed) -> bool:
             _password_form_html = _passkey_button_html
         else:
             _password_form_html = ""
+        _login_subtitle = (
+            "Enter your username and password to continue"
+            if os.getenv("HERMES_WEBUI_USERNAME", "").strip()
+            else _login_strings["subtitle"]
+        )
+        _login_invalid = (
+            "Invalid username or password"
+            if os.getenv("HERMES_WEBUI_USERNAME", "").strip()
+            else _login_strings["invalid_pw"]
+        )
         version_token = quote(WEBUI_VERSION, safe="")
         _page = (
             _LOGIN_PAGE_HTML.replace("{{BOT_NAME}}", _bn)
@@ -16302,9 +16456,9 @@ def handle_get(handler, parsed) -> bool:
             .replace("{{WEBUI_VERSION}}", version_token)
             .replace("{{LANG}}", _html.escape(_login_strings["lang"]))
             .replace("{{LOGIN_TITLE}}", _html.escape(_login_strings["title"]))
-            .replace("{{LOGIN_SUBTITLE}}", _html.escape(_login_strings["subtitle"]))
+            .replace("{{LOGIN_SUBTITLE}}", _html.escape(_login_subtitle))
             .replace("{{PASSWORD_FORM_HTML}}", _password_form_html)
-            .replace("{{LOGIN_INVALID_PW}}", _html.escape(_login_strings["invalid_pw"]))
+            .replace("{{LOGIN_INVALID_PW}}", _html.escape(_login_invalid))
             .replace(
                 "{{LOGIN_CONN_FAILED}}", _html.escape(_login_strings["conn_failed"])
             )
@@ -21253,9 +21407,11 @@ def handle_post(handler, parsed) -> bool:
                 status=429,
             )
         password = body.get("password", "")
-        if not verify_password(password):
+        expected_username = os.getenv("HERMES_WEBUI_USERNAME", "").strip()
+        username = str(body.get("username", "") or "").strip()
+        if (expected_username and username != expected_username) or not verify_password(password):
             _record_login_attempt(client_ip)
-            return bad(handler, "Invalid password", 401)
+            return bad(handler, "Invalid username or password", 401)
         _clear_login_attempts(client_ip)
         cookie_val = create_session()
         body = json.dumps({"ok": True}).encode()

@@ -5,6 +5,7 @@
 document.addEventListener('DOMContentLoaded', function () {
   var form = document.getElementById('login-form');
   var input = document.getElementById('pw');
+  var userInput = document.getElementById('user');
   var passkeyBtn = document.getElementById('passkey-login');
 
   // #7056: the password input is absent on a passwordless deployment (OIDC-only,
@@ -79,12 +80,13 @@ document.addEventListener('DOMContentLoaded', function () {
     // No password input on a passwordless deployment: nothing to submit.
     if (!input) return;
     var pw = input.value;
+    var username = userInput ? userInput.value : '';
     hideErr();
     try {
       var res = await fetch('api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: pw }),
+        body: JSON.stringify({ username: username, password: pw }),
         credentials: 'include',
       });
       var data = {};
